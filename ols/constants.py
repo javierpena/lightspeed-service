@@ -240,6 +240,9 @@ MCP_HTTP_TRANSPORT_DEFAULT_TIMEOUT = 5  # in seconds
 MCP_KUBERNETES_PLACEHOLDER = "kubernetes"
 MCP_CLIENT_PLACEHOLDER = "client"
 
+# Minimum normalized BM25 score for an MCP prompt to be considered a match
+MCP_PROMPT_MATCH_THRESHOLD = 0.3
+
 # timeout value for a single llm with tools round
 # Keeping it really high at this moment (until this is configurable)
 TOOL_CALL_ROUND_TIMEOUT = 300

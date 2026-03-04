@@ -7,13 +7,13 @@ from math import ceil
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.messages.ai import AIMessageChunk
 
 from ols import config
 from ols.app.models.config import MCPServerConfig
 from ols.constants import TOKEN_BUFFER_WEIGHT
-from ols.utils.mcp_utils import _normalize_tool_schema, gather_mcp_tools
+from ols.utils.mcp_utils import MCPPromptInfo, _normalize_tool_schema, gather_mcp_tools
 from ols.utils.token_handler import TokenHandler
 from tests.mock_classes.mock_tools import (
     MOCK_TOOL_META,
@@ -1264,3 +1264,347 @@ def test_tool_call_without_meta_has_no_tool_meta_key():
 
         assert tool_call["name"] == "get_namespaces_mock"
         assert "tool_meta" not in tool_call
+
+
+def _make_prompt_info(
+    name: str = "test-prompt",
+    description: str = "A test prompt",
+    server_name: str = "test-server",
+) -> MCPPromptInfo:
+    """Create an MCPPromptInfo for tests."""
+    return MCPPromptInfo(
+        name=name,
+        description=description,
+        arguments=[],
+        server_name=server_name,
+    )
+
+
+@pytest.mark.asyncio
+class TestApplyMcpPrompt:
+    """Tests for DocsSummarizer._apply_mcp_prompt."""
+
+    async def test_no_mcp_servers(self):
+        """Test passthrough when no MCP servers configured."""
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        query, history = await summarizer._apply_mcp_prompt("hello", None)
+        assert query == "hello"
+        assert history is None
+
+    async def test_no_prompts_available(self):
+        """Test passthrough when servers exist but expose no prompts."""
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            query, history = await summarizer._apply_mcp_prompt("hello", None)
+            assert query == "hello"
+            assert history is None
+
+    async def test_no_match(self):
+        """Test passthrough when no prompt matches the query."""
+        prompts = [_make_prompt_info(name="deploy", description="Deploy app")]
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=prompts),
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.match_mcp_prompt",
+                return_value=None,
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            query, history = await summarizer._apply_mcp_prompt(
+                "unrelated question", None
+            )
+            assert query == "unrelated question"
+            assert history is None
+
+    async def test_single_message_replaces_query(self):
+        """Test that a single HumanMessage prompt replaces the query."""
+        matched_prompt = _make_prompt_info(name="greet", server_name="s1")
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=[matched_prompt]),
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.match_mcp_prompt",
+                return_value=matched_prompt,
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+                return_value={"s1": {"transport": "streamable_http", "url": "http://s1"}},
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.fetch_mcp_prompt",
+                new=AsyncMock(
+                    return_value=[HumanMessage(content="Hello from prompt")]
+                ),
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+            patch.object(
+                DocsSummarizer, "_build_prompt_arguments", new=AsyncMock(return_value=None)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            query, history = await summarizer._apply_mcp_prompt("greet me", None)
+            assert query == "Hello from prompt"
+            assert history is None
+
+    async def test_multi_message_augments_history(self):
+        """Test that multi-message prompts prepend to history."""
+        matched_prompt = _make_prompt_info(name="chat", server_name="s1")
+        prompt_messages = [
+            HumanMessage(content="Context message"),
+            AIMessage(content="Acknowledged"),
+            HumanMessage(content="Now answer this"),
+        ]
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=[matched_prompt]),
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.match_mcp_prompt",
+                return_value=matched_prompt,
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+                return_value={"s1": {"transport": "streamable_http", "url": "http://s1"}},
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.fetch_mcp_prompt",
+                new=AsyncMock(return_value=prompt_messages),
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+            patch.object(
+                DocsSummarizer, "_build_prompt_arguments", new=AsyncMock(return_value=None)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            existing_history = [HumanMessage(content="old")]
+            query, history = await summarizer._apply_mcp_prompt(
+                "chat query", existing_history
+            )
+            assert query == "Now answer this"
+            assert len(history) == 3
+            assert isinstance(history[0], HumanMessage)
+            assert history[0].content == "Context message"
+            assert isinstance(history[1], AIMessage)
+            assert history[2].content == "old"
+
+    async def test_fetch_failure_passes_through(self):
+        """Test passthrough when prompt fetch returns empty."""
+        matched_prompt = _make_prompt_info(name="fail", server_name="s1")
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=[matched_prompt]),
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.match_mcp_prompt",
+                return_value=matched_prompt,
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+                return_value={"s1": {"transport": "streamable_http", "url": "http://s1"}},
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.fetch_mcp_prompt",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+            patch.object(
+                DocsSummarizer, "_build_prompt_arguments", new=AsyncMock(return_value=None)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            query, history = await summarizer._apply_mcp_prompt("fail query", None)
+            assert query == "fail query"
+            assert history is None
+
+    async def test_ai_only_messages_pass_through(self):
+        """Test passthrough when prompt returns only AIMessages (no HumanMessage)."""
+        matched_prompt = _make_prompt_info(name="ai-only", server_name="s1")
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_prompts",
+                new=AsyncMock(return_value=[matched_prompt]),
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.match_mcp_prompt",
+                return_value=matched_prompt,
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+                return_value={"s1": {"transport": "streamable_http", "url": "http://s1"}},
+            ),
+            patch(
+                "ols.src.query_helpers.docs_summarizer.fetch_mcp_prompt",
+                new=AsyncMock(return_value=[AIMessage(content="no human here")]),
+            ),
+            patch.object(
+                DocsSummarizer, "_has_mcp_tools", new_callable=lambda: property(lambda self: True)
+            ),
+            patch.object(
+                DocsSummarizer, "_build_prompt_arguments", new=AsyncMock(return_value=None)
+            ),
+        ):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            query, history = await summarizer._apply_mcp_prompt("test", None)
+            assert query == "test"
+            assert history is None
+
+
+@pytest.mark.asyncio
+class TestExtractPromptArguments:
+    """Tests for DocsSummarizer._extract_prompt_arguments."""
+
+    async def test_single_argument_extracted(self):
+        """Test LLM extracts a single argument value."""
+        llm_response = MagicMock()
+        llm_response.content = '{"topic": "kubernetes networking"}'
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [{"name": "topic", "description": "The topic to explain"}]
+        result = await summarizer._extract_prompt_arguments(
+            "explain kubernetes networking in detail", args
+        )
+        assert result == {"topic": "kubernetes networking"}
+
+    async def test_multiple_arguments_extracted(self):
+        """Test LLM extracts multiple argument values."""
+        llm_response = MagicMock()
+        llm_response.content = '{"language": "python", "task": "sort a list"}'
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [
+            {"name": "language", "description": "Programming language"},
+            {"name": "task", "description": "The coding task"},
+        ]
+        result = await summarizer._extract_prompt_arguments(
+            "write python code to sort a list", args
+        )
+        assert result == {"language": "python", "task": "sort a list"}
+
+    async def test_extra_keys_filtered_out(self):
+        """Test that keys not in the argument list are discarded."""
+        llm_response = MagicMock()
+        llm_response.content = '{"topic": "pods", "extra": "should be dropped"}'
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [{"name": "topic", "description": "The topic"}]
+        result = await summarizer._extract_prompt_arguments("tell me about pods", args)
+        assert result == {"topic": "pods"}
+        assert "extra" not in result
+
+    async def test_code_fence_stripped(self):
+        """Test that markdown code fences around JSON are stripped."""
+        llm_response = MagicMock()
+        llm_response.content = '```json\n{"topic": "routes"}\n```'
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [{"name": "topic", "description": "The topic"}]
+        result = await summarizer._extract_prompt_arguments("how do routes work", args)
+        assert result == {"topic": "routes"}
+
+    async def test_fallback_on_invalid_json(self):
+        """Test fallback to raw query when LLM returns invalid JSON."""
+        llm_response = MagicMock()
+        llm_response.content = "not valid json"
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [{"name": "topic", "description": "The topic"}]
+        result = await summarizer._extract_prompt_arguments("my query", args)
+        assert result == {"topic": "my query"}
+
+    async def test_fallback_on_llm_exception(self):
+        """Test fallback to raw query when LLM call raises."""
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(side_effect=RuntimeError("timeout"))
+
+        args = [
+            {"name": "a", "description": "first"},
+            {"name": "b", "description": "second"},
+        ]
+        result = await summarizer._extract_prompt_arguments("the query", args)
+        assert result == {"a": "the query", "b": "the query"}
+
+    async def test_values_cast_to_string(self):
+        """Test that non-string values are cast to strings."""
+        llm_response = MagicMock()
+        llm_response.content = '{"count": 42, "flag": true}'
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.bare_llm = AsyncMock()
+        summarizer.bare_llm.ainvoke = AsyncMock(return_value=llm_response)
+
+        args = [
+            {"name": "count", "description": "A number"},
+            {"name": "flag", "description": "A boolean"},
+        ]
+        result = await summarizer._extract_prompt_arguments("give me 42 things", args)
+        assert result == {"count": "42", "flag": "True"}
+
+
+@pytest.mark.asyncio
+class TestBuildPromptArguments:
+    """Tests for DocsSummarizer._build_prompt_arguments."""
+
+    async def test_no_arguments_returns_none(self):
+        """Test that a prompt with no arguments produces None."""
+        prompt = _make_prompt_info(name="simple")
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        result = await summarizer._build_prompt_arguments(prompt, "some query")
+        assert result is None
+
+    async def test_empty_arguments_returns_none(self):
+        """Test that a prompt with an empty arguments list produces None."""
+        prompt = _make_prompt_info(name="empty")
+        prompt["arguments"] = []
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        result = await summarizer._build_prompt_arguments(prompt, "some query")
+        assert result is None
+
+    async def test_delegates_to_extract(self):
+        """Test that _build_prompt_arguments calls _extract_prompt_arguments."""
+        prompt = _make_prompt_info(name="review")
+        prompt["arguments"] = [
+            {"name": "code", "description": "Source code", "required": True}
+        ]
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer._extract_prompt_arguments = AsyncMock(
+            return_value={"code": "def hello(): pass"}
+        )
+        result = await summarizer._build_prompt_arguments(prompt, "review def hello(): pass")
+        assert result == {"code": "def hello(): pass"}
+        summarizer._extract_prompt_arguments.assert_awaited_once_with(
+            "review def hello(): pass", prompt["arguments"]
+        )

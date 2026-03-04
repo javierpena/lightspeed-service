@@ -47,6 +47,8 @@ class AppConfig:
         self._token_usage_history: Optional[TokenUsageHistory] = None
         self.k8s_tools_resolved = False
         self._tools_approval: Optional[config_model.ToolsApprovalConfig] = None
+        self.mcp_prompts_loaded = False
+        self._mcp_prompts: list = []
 
     @property
     def llm_config(self) -> config_model.LLMProviders:
@@ -210,6 +212,8 @@ class AppConfig:
             self._query_filters = None
             self._rag_index_loader = None
             self._tools_approval = None
+            self.mcp_prompts_loaded = False
+            self._mcp_prompts = []
             # Clear cached_property if it exists
             if "mcp_servers_dict" in self.__dict__:
                 del self.__dict__["mcp_servers_dict"]

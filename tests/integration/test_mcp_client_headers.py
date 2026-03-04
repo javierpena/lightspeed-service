@@ -82,7 +82,10 @@ def test_query_without_client_headers(_setup: None) -> None:
         assert response.status_code == 200
 
         # Verify MCP client was called with only file-auth server (no client-auth)
-        mock_mcp_client_class.assert_called_once()
+        #mock_mcp_client_class.assert_called_once()
+
+        assert mock_mcp_client_class.call_count == 2
+
         call_args = mock_mcp_client_class.call_args
         mcp_config = call_args[0][0]
 
@@ -124,7 +127,8 @@ def test_query_with_client_headers(_setup: None) -> None:
         assert response.status_code == 200
 
         # Verify MCP client was initialized with correct config including headers
-        mock_mcp_client_class.assert_called_once()
+       # mock_mcp_client_class.assert_called_once()
+        assert mock_mcp_client_class.call_count == 2
         call_args = mock_mcp_client_class.call_args
         mcp_config = call_args[0][0]
 
@@ -171,7 +175,8 @@ def test_streaming_query_without_client_headers(_setup: None) -> None:
         assert response.status_code == 200
 
         # Verify MCP client was called with only file-auth server
-        mock_mcp_client_class.assert_called_once()
+#        mock_mcp_client_class.assert_called_once()
+        assert mock_mcp_client_class.call_count == 2
         call_args = mock_mcp_client_class.call_args
         mcp_config = call_args[0][0]
 
@@ -210,7 +215,8 @@ def test_streaming_query_with_client_headers(_setup: None) -> None:
         assert response.status_code == 200
 
         # Verify MCP client was initialized with correct config including headers
-        mock_mcp_client_class.assert_called_once()
+#        mock_mcp_client_class.assert_called_once()
+        assert mock_mcp_client_class.call_count == 2
         call_args = mock_mcp_client_class.call_args
         mcp_config = call_args[0][0]
 

@@ -8,7 +8,7 @@ from collections.abc import Coroutine
 from typing import Any, AsyncGenerator, Optional, TypeAlias
 
 from langchain_core.globals import set_debug
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools.structured import StructuredTool
@@ -23,7 +23,16 @@ from ols.customize import reranker
 from ols.src.prompts.prompt_generator import GeneratePrompt
 from ols.src.query_helpers.query_helper import QueryHelper
 from ols.src.tools.tools import execute_tool_calls
-from ols.utils.mcp_utils import ClientHeaders, get_mcp_tools
+from ols.utils.mcp_utils import (
+    ClientHeaders,
+    MCPPromptArgument,
+    MCPPromptInfo,
+    build_mcp_config,
+    fetch_mcp_prompt,
+    get_mcp_prompts,
+    get_mcp_tools,
+    match_mcp_prompt,
+)
 from ols.utils.token_handler import TokenHandler
 
 logger = logging.getLogger(__name__)
@@ -559,6 +568,124 @@ class DocsSummarizer(QueryHelper):
                     ):
                         yield result_chunk
 
+    async def _extract_prompt_arguments(
+        self,
+        query: str,
+        arguments: list[MCPPromptArgument],
+    ) -> dict[str, str]:
+        """Use the LLM to extract argument values from the user query.
+
+        Args:
+            query: The user's query text.
+            arguments: Argument definitions from the MCP prompt.
+
+        Returns:
+            Dictionary mapping argument names to extracted values.
+        """
+        arg_descriptions = "\n".join(
+            f'- "{a["name"]}": {a.get("description", "no description")}'
+            for a in arguments
+        )
+        extraction_prompt = (
+            "Extract specific values for the following named arguments "
+            "from the user message below.\n"
+            "Return ONLY a valid JSON object mapping each argument name "
+            "to its extracted value (a string).\n"
+            "If a value cannot be determined, use an empty string.\n\n"
+            f"Arguments:\n{arg_descriptions}\n\n"
+            f"User message:\n{query}\n\n"
+            "JSON:"
+        )
+
+        try:
+            response = await self.bare_llm.ainvoke(extraction_prompt)
+            raw = response.content if hasattr(response, "content") else str(response)
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            extracted: dict[str, str] = json.loads(raw)
+            expected_names = {a["name"] for a in arguments}
+            return {k: str(v) for k, v in extracted.items() if k in expected_names}
+        except Exception as e:
+            logger.warning("LLM argument extraction failed, falling back: %s", e)
+            return {a["name"]: query for a in arguments}
+
+    async def _build_prompt_arguments(
+        self,
+        prompt: MCPPromptInfo,
+        query: str,
+    ) -> dict[str, str] | None:
+        """Build the arguments dict for an MCP prompt.
+
+        Uses the LLM to extract individual argument values from the query
+        when the prompt declares arguments, returns None otherwise.
+
+        Args:
+            prompt: Prompt metadata with argument definitions.
+            query: The user's query text.
+
+        Returns:
+            Arguments dict, or None if the prompt has no arguments.
+        """
+        arguments = prompt.get("arguments")
+        if not arguments:
+            return None
+        return await self._extract_prompt_arguments(query, arguments)
+
+    async def _apply_mcp_prompt(
+        self,
+        query: str,
+        history: MessageHistory | None,
+    ) -> tuple[str, MessageHistory | None]:
+        """Check for a matching MCP prompt and replace the query if found.
+
+        Args:
+            query: The original user query.
+            history: The current conversation history.
+
+        Returns:
+            Tuple of (possibly replaced query, possibly augmented history).
+        """
+        if not self._has_mcp_tools:
+            return query, history
+
+        prompts = await get_mcp_prompts(self.user_token, self.client_headers)
+        if not prompts:
+            return query, history
+
+        matched = match_mcp_prompt(query, prompts)
+        if matched is None:
+            return query, history
+
+        servers_config = build_mcp_config(
+            config.mcp_servers.servers, self.user_token, self.client_headers
+        )
+        arguments = await self._build_prompt_arguments(matched, query)
+        prompt_messages = await fetch_mcp_prompt(
+            matched, servers_config, arguments=arguments
+        )
+        if not prompt_messages:
+            return query, history
+
+        last_human = next(
+            (m for m in reversed(prompt_messages) if isinstance(m, HumanMessage)),
+            None,
+        )
+        if last_human is None:
+            return query, history
+
+        new_query = str(last_human.content)
+        prefix = [m for m in prompt_messages if m is not last_human]
+        if prefix:
+            history = prefix + (history or [])
+
+        logger.info(
+            "Replaced query with MCP prompt '%s' from server '%s'",
+            matched["name"],
+            matched["server_name"],
+        )
+        return new_query, history
+
     async def generate_response(
         self,
         query: str,
@@ -575,6 +702,10 @@ class DocsSummarizer(QueryHelper):
         Yields:
             StreamedChunk objects representing parts of the response
         """
+        logger.info("JPENA before apply_mcp_prompt")
+        query, history = await self._apply_mcp_prompt(query, history)
+        logger.info("JPENA after: %s" % query)
+
         final_prompt, llm_input_values, rag_chunks, truncated = self._prepare_prompt(
             query, rag_retriever, history
         )

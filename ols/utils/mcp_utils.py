@@ -1,8 +1,9 @@
-"""Utilities for parsing and validating MCP client headers."""
+"""Utilities for parsing and validating MCP client headers and prompts."""
 
 import logging
-from typing import Optional, TypeAlias, TypedDict
+from typing import Any, Optional, TypeAlias, TypedDict
 
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools.structured import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -24,6 +25,23 @@ class MCPServerTransport(TypedDict, total=False):
 # Type aliases for clarity and reusability
 ClientHeaders: TypeAlias = dict[str, dict[str, str]]
 MCPServersDict: TypeAlias = dict[str, MCPServerTransport]
+
+
+class MCPPromptArgument(TypedDict, total=False):
+    """Argument metadata for an MCP prompt."""
+
+    name: str
+    description: str
+    required: bool
+
+
+class MCPPromptInfo(TypedDict):
+    """Metadata for an MCP prompt discovered from a server."""
+
+    name: str
+    description: str
+    arguments: list[MCPPromptArgument]
+    server_name: str
 
 
 def get_servers_requiring_client_headers(
@@ -193,20 +211,17 @@ async def gather_mcp_tools(
     for server_name in mcp_servers:
         try:
             server_tools = await mcp_client.get_tools(server_name=server_name)
-
             # Filter immediately if we have an allowlist
             if allowed_tool_names:
                 server_tools = [
                     tool for tool in server_tools if tool.name in allowed_tool_names
                 ]
-
             # Add MCP server name to each tool's metadata
             for tool in server_tools:
                 _normalize_tool_schema(tool)
                 if not hasattr(tool, "metadata") or tool.metadata is None:
                     tool.metadata = {}
                 tool.metadata["mcp_server"] = server_name
-
             all_tools.extend(server_tools)
             logger.info(
                 "Loaded %d tools from MCP server '%s'",
@@ -217,6 +232,59 @@ async def gather_mcp_tools(
             logger.error("Failed to get tools from MCP server '%s': %s", server_name, e)
 
     return all_tools
+
+
+async def gather_mcp_prompts(mcp_servers: MCPServersDict) -> list[MCPPromptInfo]:
+    """Gather prompts from multiple MCP servers with failure isolation.
+
+    Load prompts from each MCP server individually so that if one server
+    is unreachable, prompts from other servers are still available.
+
+    Args:
+        mcp_servers: Dictionary mapping server names to their configurations.
+
+    Returns:
+        List of prompt metadata from all successfully connected servers.
+    """
+    all_prompts: list[MCPPromptInfo] = []
+    mcp_client = MultiServerMCPClient(mcp_servers)
+
+    for server_name in mcp_servers:
+        try:
+            async with mcp_client.session(server_name) as session:
+                result = await session.list_prompts()
+
+            for prompt in result.prompts:
+                arguments: list[MCPPromptArgument] = []
+                if prompt.arguments:
+                    for arg in prompt.arguments:
+                        arg_info: MCPPromptArgument = {"name": arg.name}
+                        if arg.description:
+                            arg_info["description"] = arg.description
+                        if arg.required is not None:
+                            arg_info["required"] = arg.required
+                        arguments.append(arg_info)
+
+                all_prompts.append(
+                    MCPPromptInfo(
+                        name=prompt.name,
+                        description=prompt.description or "",
+                        arguments=arguments,
+                        server_name=server_name,
+                    )
+                )
+
+            logger.info(
+                "Loaded %d prompts from MCP server '%s'",
+                len(result.prompts),
+                server_name,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to list prompts from MCP server '%s': %s", server_name, e
+            )
+
+    return all_prompts
 
 
 async def _gather_and_populate_tools(
@@ -417,6 +485,154 @@ async def get_mcp_tools(
     # Fallback: return empty list if filtering failed
     logger.warning("No tools matched the query filter")
     return []
+
+
+def _build_prompt_text(prompt: MCPPromptInfo) -> str:
+    """Build searchable text representation of a prompt.
+
+    Args:
+        prompt: Prompt metadata.
+
+    Returns:
+        Combined name and description string.
+    """
+    return f"{prompt['name']} {prompt['description']}"
+
+
+def match_mcp_prompt(
+    query: str,
+    prompts: list[MCPPromptInfo],
+    threshold: float = constants.MCP_PROMPT_MATCH_THRESHOLD,
+) -> MCPPromptInfo | None:
+    """Match a user query against available MCP prompts using word overlap scoring.
+
+    Uses Jaccard similarity between query tokens and prompt text tokens.
+    This is simple and robust for the typically small number of MCP prompts.
+
+    Args:
+        query: The user's query string.
+        prompts: List of available MCP prompt metadata.
+        threshold: Minimum similarity score to accept a match (0-1).
+
+    Returns:
+        The best-matching prompt if above threshold, or None.
+    """
+    if not prompts or not query.strip():
+        return None
+
+    query_tokens = set(query.lower().split())
+    best_score = 0.0
+    best_idx = -1
+
+    for i, prompt in enumerate(prompts):
+        prompt_tokens = set(_build_prompt_text(prompt).lower().split())
+        intersection = query_tokens & prompt_tokens
+        union = query_tokens | prompt_tokens
+        score = len(intersection) / len(union) if union else 0.0
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx < 0 or best_score < threshold:
+        logger.debug(
+            "No MCP prompt matched query (best score %.3f < threshold %.3f)",
+            best_score,
+            threshold,
+        )
+        return None
+
+    matched = prompts[best_idx]
+    logger.info(
+        "Matched MCP prompt '%s' from server '%s' (score %.3f)",
+        matched["name"],
+        matched["server_name"],
+        best_score,
+    )
+    return matched
+
+
+async def get_mcp_prompts(
+    user_token: Optional[str] = None,
+    client_headers: ClientHeaders | None = None,
+) -> list[MCPPromptInfo]:
+    """Get all MCP prompts, loading and caching them on first call.
+
+    Args:
+        user_token: Optional user authentication token for server access.
+        client_headers: Optional client-provided MCP headers for authentication.
+
+    Returns:
+        List of prompt metadata from all configured MCP servers.
+    """
+    if not config.mcp_servers or not config.mcp_servers.servers:
+        return []
+
+    if config.mcp_prompts_loaded:
+        return config._mcp_prompts
+
+    servers_config = build_mcp_config(
+        config.mcp_servers.servers, user_token, client_headers
+    )
+    if not servers_config:
+        logger.debug("No MCP servers available for prompt discovery")
+        return []
+
+    prompts = await gather_mcp_prompts(servers_config)
+    config._mcp_prompts = prompts
+    config.mcp_prompts_loaded = True
+
+    logger.info("Cached %d MCP prompts from %d servers", len(prompts), len(servers_config))
+    return prompts
+
+
+async def fetch_mcp_prompt(
+    prompt: MCPPromptInfo,
+    mcp_servers_config: MCPServersDict,
+    arguments: dict[str, Any] | None = None,
+) -> list[HumanMessage | AIMessage]:
+    """Fetch prompt messages from an MCP server.
+
+    Args:
+        prompt: Prompt metadata identifying the server and prompt name.
+        mcp_servers_config: Resolved MCP server transport configurations.
+        arguments: Optional arguments to pass to the prompt template.
+
+    Returns:
+        List of LangChain messages produced by the prompt.
+    """
+    server_name = prompt["server_name"]
+    prompt_name = prompt["name"]
+
+    if server_name not in mcp_servers_config:
+        logger.error(
+            "Server '%s' for prompt '%s' not found in MCP config",
+            server_name,
+            prompt_name,
+        )
+        return []
+
+    server_only_config: MCPServersDict = {server_name: mcp_servers_config[server_name]}
+    mcp_client = MultiServerMCPClient(server_only_config)
+
+    try:
+        messages = await mcp_client.get_prompt(
+            server_name, prompt_name, arguments=arguments
+        )
+        logger.info(
+            "Fetched prompt '%s' from server '%s' (%d messages)",
+            prompt_name,
+            server_name,
+            len(messages),
+        )
+        return messages
+    except Exception as e:
+        logger.error(
+            "Failed to fetch prompt '%s' from server '%s': %s",
+            prompt_name,
+            server_name,
+            e,
+        )
+        return []
 
 
 def build_mcp_config(

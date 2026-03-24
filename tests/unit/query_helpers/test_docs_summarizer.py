@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from typing import ClassVar
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -160,6 +160,49 @@ def test_summarize_no_reference_content():
     assert question in summary.response
     assert summary.rag_chunks == []
     assert not summary.history_truncated
+
+
+def test_summarize_with_skill_injected(caplog):
+    """Skill content is prepended to rag_context when skills_rag returns a match."""
+    mock_skill = MagicMock()
+    mock_skill.name = "node-not-ready"
+    mock_skill.load_content.return_value = "## Skill: Node Not Ready\n\nFollow these steps."
+
+    mock_skills_rag = MagicMock()
+    mock_skills_rag.retrieve_skill.return_value = (mock_skill, 0.92)
+
+    with (
+        patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
+        patch("ols.utils.token_handler.MINIMUM_CONTEXT_TOKEN_LIMIT", 1),
+        patch.object(config, "skills_rag", mock_skills_rag),
+        caplog.at_level(logging.INFO),
+    ):
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        question = "My node is NotReady"
+        summary = summarizer.create_response(question, MockRetriever(), [])
+
+    mock_skills_rag.retrieve_skill.assert_called_once_with(question)
+    mock_skill.load_content.assert_called_once()
+    assert "node-not-ready" in caplog.text
+    assert "0.920" in caplog.text
+
+
+def test_summarize_with_no_skill_match():
+    """No skill content is injected when skills_rag returns None."""
+    mock_skills_rag = MagicMock()
+    mock_skills_rag.retrieve_skill.return_value = (None, 0.0)
+
+    with (
+        patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
+        patch("ols.utils.token_handler.MINIMUM_CONTEXT_TOKEN_LIMIT", 1),
+        patch.object(config, "skills_rag", mock_skills_rag),
+    ):
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        question = "What is the capital of France?"
+        summary = summarizer.create_response(question, MockRetriever(), [])
+
+    mock_skills_rag.retrieve_skill.assert_called_once_with(question)
+    assert summary.rag_chunks  # RAG chunks from retriever still present
 
 
 def test_summarize_retrieval_logging(caplog):

@@ -218,6 +218,16 @@ class DocsSummarizer(QueryHelper):
         if len(rag_context) == 0:
             logger.debug("Using llm to answer the query without reference content")
 
+        if config.skills_rag is not None:
+            skill, score = config.skills_rag.retrieve_skill(query)
+            if skill is not None:
+                logger.info(
+                    "Injecting skill '%s' (score=%.3f) into context",
+                    skill.name,
+                    score,
+                )
+                rag_context.insert(0, skill.load_content())
+
         # Truncate history
         history, truncated = token_handler.limit_conversation_history(
             history or [], available_tokens

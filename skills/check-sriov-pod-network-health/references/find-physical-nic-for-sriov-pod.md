@@ -151,4 +151,4 @@ status:
 
 ```
 
-We can see that, for example, NIC ens2f0 has 3 VFs, with PCI IDs 0000:51:09.0, 0000:51:09.1 and 0000:51:09.2. Match those PCI IDs with the information displayed by the k8s.v1.cni.cncf.io/network-status annotation of the pod.
+We can see that, for example, NIC ens2f1 has 3 VFs, with PCI IDs 0000:51:09.0, 0000:51:09.1 and 0000:51:09.2. Match those PCI IDs with the information displayed by the k8s.v1.cni.cncf.io/network-status annotation of the pod.

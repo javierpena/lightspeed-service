@@ -157,34 +157,23 @@ class DocsSummarizer(QueryHelper):
             self.generic_llm_params,
         )
 
-    def _prepare_prompt(
+    def _prepare_prompt_context(
         self,
         query: str,
         rag_retriever: Optional[BaseRetriever] = None,
-        history: Optional[list[BaseMessage]] = None,
-    ) -> tuple[ChatPromptTemplate, dict[str, str], list[RagChunk], bool]:
-        """Summarize the given query based on the provided conversation context.
+    ) -> tuple[TokenHandler, list[RagChunk], int, int]:
+        """Calculate token budget and retrieve RAG content.
 
         Args:
-            query: The query to be summarized.
+            query: The query to be answered.
             rag_retriever: The retriever to get RAG data/context.
-            history: The history of the conversation (if available).
 
         Returns:
-            A tuple containing the final prompt, input values, RAG chunks,
-            and a flag for truncated history.
+            Tuple of (token_handler, rag_chunks, available_tokens, max_tokens_for_tools).
         """
-        # if history is not provided, initialize to empty history
-        if history is None:
-            history = []
-
         token_handler = TokenHandler()
 
-        # Use sample text for context/history to get complete prompt
-        # instruction. This is used to calculate available tokens.
         temp_prompt, temp_prompt_input = GeneratePrompt(
-            # Sample prompt's context/history must be re-structured for the given model,
-            # to ensure the further right available token calculation.
             query,
             ["sample"],
             [AIMessage("sample")],
@@ -201,12 +190,10 @@ class DocsSummarizer(QueryHelper):
             max_tokens_for_tools,
         )
 
-        # Retrieve RAG content
         if rag_retriever:
             retrieved_nodes = rag_retriever.retrieve(query)
             logger.info("Retrieved %d documents from indexes", len(retrieved_nodes))
 
-            # Logging top retrieved candidates with scores
             for i, node in enumerate(retrieved_nodes[:5]):
                 logger.info(
                     "Retrieved doc #%d: title='%s', url='%s', index='%s', score=%.4f",
@@ -223,14 +210,34 @@ class DocsSummarizer(QueryHelper):
         else:
             logger.warning("Proceeding without RAG content. Check start up messages.")
             rag_chunks = []
+
+        return token_handler, rag_chunks, available_tokens, max_tokens_for_tools
+
+    def _build_final_prompt(
+        self,
+        query: str,
+        history: list[BaseMessage],
+        rag_chunks: list[RagChunk],
+        token_handler: TokenHandler,
+        max_tokens_for_tools: int,
+        skill_content: Optional[str] = None,
+    ) -> tuple[ChatPromptTemplate, dict[str, str]]:
+        """Build the final LLM prompt from collected context.
+
+        Args:
+            query: The user query.
+            history: Truncated conversation history.
+            rag_chunks: Retrieved RAG chunks.
+            token_handler: Token handler for budget checking.
+            max_tokens_for_tools: Token budget reserved for tools.
+            skill_content: Optional skill body to inject into the prompt.
+
+        Returns:
+            Tuple of (prompt_template, llm_input_values).
+        """
         rag_context = [rag_chunk.text for rag_chunk in rag_chunks]
         if len(rag_context) == 0:
             logger.debug("Using llm to answer the query without reference content")
-
-        # Truncate history
-        history, truncated = token_handler.limit_conversation_history(
-            history or [], available_tokens
-        )
 
         final_prompt, llm_input_values = GeneratePrompt(
             query,
@@ -238,11 +245,9 @@ class DocsSummarizer(QueryHelper):
             history,
             self._system_prompt,
             self._tool_calling_enabled,
+            skill_content=skill_content,
         ).generate_prompt(self.model)
 
-        # Tokens-check: We trigger the computation of the token count
-        # without care about the return value. This is to ensure that
-        # the query is within the token limit.
         token_handler.calculate_and_check_available_tokens(
             final_prompt.format(**llm_input_values),
             self.model_config.context_window_size,
@@ -250,7 +255,7 @@ class DocsSummarizer(QueryHelper):
             max_tokens_for_tools,
         )
 
-        return final_prompt, llm_input_values, rag_chunks, truncated
+        return final_prompt, llm_input_values
 
     async def _invoke_llm(
         self,
@@ -886,9 +891,68 @@ class DocsSummarizer(QueryHelper):
         Yields:
             StreamedChunk objects representing parts of the response
         """
-        final_prompt, llm_input_values, rag_chunks, truncated = self._prepare_prompt(
-            query, rag_retriever, history
+        token_handler, rag_chunks, available_tokens, max_tokens_for_tools = (
+            self._prepare_prompt_context(query, rag_retriever)
         )
+
+        skill_content: Optional[str] = None
+        skills_rag = config.skills_rag
+        if skills_rag is not None:
+            skill, confidence = skills_rag.retrieve_skill(query)
+            if skill is not None:
+                skill_content = skill.load_content()
+                skill_tokens = TokenHandler._get_token_count(
+                    token_handler.text_to_tokens(skill_content)
+                )
+                if skill_tokens > available_tokens * 0.8:
+                    logger.warning(
+                        "Skill '%s' requires %d tokens but only %d available; skipping",
+                        skill.name,
+                        skill_tokens,
+                        available_tokens,
+                    )
+                    skill_content = None
+                    yield StreamedChunk(
+                        type=ChunkType.SKILL_SELECTED,
+                        data={
+                            "name": skill.name,
+                            "confidence": confidence,
+                            "skipped": True,
+                            "reason": "exceeds token budget",
+                        },
+                    )
+                else:
+                    if skill_tokens > available_tokens * 0.5:
+                        logger.warning(
+                            "Skill '%s' uses %d tokens (%.0f%% of available budget)",
+                            skill.name,
+                            skill_tokens,
+                            skill_tokens / available_tokens * 100,
+                        )
+                    available_tokens -= skill_tokens
+                    yield StreamedChunk(
+                        type=ChunkType.SKILL_SELECTED,
+                        data={
+                            "name": skill.name,
+                            "confidence": confidence,
+                        },
+                    )
+
+        if history is None:
+            history = []
+        history, truncated = token_handler.limit_conversation_history(
+            history, available_tokens
+        )
+
+        final_prompt, llm_input_values = self._build_final_prompt(
+            query=query,
+            history=history,
+            rag_chunks=rag_chunks,
+            token_handler=token_handler,
+            max_tokens_for_tools=max_tokens_for_tools,
+            skill_content=skill_content,
+        )
+
         messages = final_prompt.model_copy()
         all_mcp_tools = await get_mcp_tools(query, self.user_token, self.client_headers)
         with TokenMetricUpdater(
@@ -945,6 +1009,8 @@ class DocsSummarizer(QueryHelper):
                         tool_calls.append(chunk.data)
                     case ChunkType.TOOL_RESULT:
                         tool_results.append(chunk.data)
+                    case ChunkType.SKILL_SELECTED:
+                        continue
                     case ChunkType.REASONING:
                         pass
                     case ChunkType.TEXT:

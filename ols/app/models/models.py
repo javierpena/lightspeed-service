@@ -996,6 +996,7 @@ class ChunkType(str, Enum):
     TEXT = "text"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    SKILL_SELECTED = "skill_selected"
     END = "end"
     REASONING = "reasoning"
 

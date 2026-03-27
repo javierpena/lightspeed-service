@@ -163,16 +163,19 @@ def stream_event(data: dict[str, object], event_type: str, media_type: str) -> s
     if media_type == MEDIA_TYPE_TEXT:
         match event_type:
             case _ if event_type == TOKEN_KEY_TOKEN:
-                return data[TOKEN_KEY_TOKEN]
+                result = data[TOKEN_KEY_TOKEN]
             case _ if event_type == TOKEN_KEY_REASONING:
-                return data[TOKEN_KEY_REASONING]
+                result = data[TOKEN_KEY_REASONING]
             case ChunkType.TOOL_CALL.value:
-                return f"\nTool call: {json.dumps(data)}\n"
+                result = f"\nTool call: {json.dumps(data)}\n"
             case ChunkType.TOOL_RESULT.value:
-                return f"\nTool result: {json.dumps(data)}\n"
+                result = f"\nTool result: {json.dumps(data)}\n"
+            case ChunkType.SKILL_SELECTED.value:
+                result = f"\nSkill selected: {data.get('name', 'unknown')}\n"
             case _:
                 logger.error("Unknown event type: %s", event_type)
-                return ""
+                result = ""
+        return result
     return format_stream_data(
         {
             STREAM_KEY_EVENT: event_type,
@@ -408,6 +411,12 @@ async def response_processing_wrapper(  # noqa: C901  # pylint: disable=R0915
                     yield stream_event(
                         data=item.data,
                         event_type=ChunkType.TOOL_RESULT.value,
+                        media_type=media_type,
+                    )
+                case ChunkType.SKILL_SELECTED:
+                    yield stream_event(
+                        data=item.data,
+                        event_type=ChunkType.SKILL_SELECTED.value,
                         media_type=media_type,
                     )
                 case ChunkType.REASONING:

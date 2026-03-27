@@ -45,6 +45,7 @@ def test_event_type_are_not_changed():
     assert TOKEN_KEY_REASONING == "reasoning"  # noqa: S105
     assert ChunkType.TOOL_CALL.value == "tool_call"
     assert ChunkType.TOOL_RESULT.value == "tool_result"
+    assert ChunkType.SKILL_SELECTED.value == "skill_selected"
     assert ChunkType.REASONING.value == "reasoning"
 
 
@@ -69,6 +70,23 @@ def test_stream_event():
     assert (
         stream_event(data, ChunkType.TOOL_RESULT.value, constants.MEDIA_TYPE_TEXT)
         == '\nTool result: {"token": "hi", "idx": 1}\n'
+    )
+
+    # skill_selected - text shows name, json wraps as SSE
+    skill_data = {"name": "pod-diagnostics", "confidence": 0.85}
+    assert "pod-diagnostics" in stream_event(
+        skill_data, ChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_TEXT
+    )
+    assert stream_event(
+        skill_data, ChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_JSON
+    ) == (
+        'data: {"event": "skill_selected", '
+        '"data": {"name": "pod-diagnostics", "confidence": 0.85}}\n\n'
+    )
+
+    # skill_selected with missing name falls back to 'unknown'
+    assert "unknown" in stream_event(
+        {}, ChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_TEXT
     )
 
     # json output
